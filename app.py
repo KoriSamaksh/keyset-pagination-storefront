@@ -1,19 +1,23 @@
 # app.py
 # This is the backend. Think of it like a librarian.
-# When the website asks "give me page 3 of Electronics books",
-# the librarian goes and finds exactly those products.
+# When the website asks "give me the next 50 products in Electronics",
+# the librarian goes and finds exactly those products — fast, and without
+# ever handing out the same product twice, even if new ones are being
+# added to the shelf right now.
 
 import os
 import random
 import datetime
+
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from supabase import create_client
 from dotenv import load_dotenv
 
-# ── Setup ──────────────────────────────────────────────────────────────────────
+# ── Setup ──────────────────────────────────────────────────────────────
 # Load secret keys from the .env file (like reading a locked diary)
 load_dotenv()
+
 supabase = create_client(os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY"))
 
 app = Flask(__name__)
@@ -21,228 +25,171 @@ CORS(app)  # lets the website talk to this backend
 
 HOW_MANY_PER_PAGE = 50  # we show 50 products at a time
 
-
-# ── The product data we use when adding fake products ─────────────────────────
+# ── Fake product data, used only when adding demo products ─────────────
 PRODUCT_NAMES = {
     "Electronics": ["Wireless Mouse", "Bluetooth Speaker", "Smart Watch"],
-    "Clothing":    ["Cotton T-Shirt", "Denim Jeans", "Hooded Sweatshirt"],
-    "Grocery":     ["Basmati Rice 5kg", "Olive Oil 1L", "Organic Honey"],
-    "Toys":        ["Building Blocks Set", "Remote Control Car", "Board Game"],
-    "Books":       ["Mystery Novel", "Cookbook", "Biography"],
-    "Shoes":       ["Running Shoes", "Leather Sandals", "Hiking Boots"],
+    "Clothing": ["Cotton T-Shirt", "Denim Jeans", "Hooded Sweatshirt"],
+    "Grocery": ["Basmati Rice 5kg", "Olive Oil 1L", "Organic Honey"],
+    "Toys": ["Building Blocks Set", "Remote Control Car", "Board Game"],
+    "Books": ["Mystery Novel", "Cookbook", "Biography"],
+    "Shoes": ["Running Shoes", "Leather Sandals", "Hiking Boots"],
 }
 BRANDS = ["Nova", "Urban", "Prime", "Zen", "Bolt", "Aria"]
 
 
-# ── Helper: ask the database for one page of products ─────────────────────────
-# This is a helper function so we don't write the same code twice.
-# "last_time" and "last_id" are like a bookmark — they tell us where to continue.
-def get_one_page(category, search, price_min, price_max, last_time, last_id):
+# ── Helper: check the "bookmark" the website sent us is safe to use ─────
+# The website remembers its place with a bookmark: the created_at time
+# and id of the last product it saw. Before we trust that bookmark and
+# put it into a database query, we make sure it's actually a real date
+# and a real whole number. Never trust raw user input directly.
+def read_the_bookmark(raw_time, raw_id):
+    if not raw_time or not raw_id:
+        return None, None  # no bookmark = start from the very first page
+    try:
+        datetime.datetime.fromisoformat(raw_time)  # must be a real timestamp
+        safe_id = str(int(raw_id))                  # must be a real whole number
+        return raw_time, safe_id
+    except (ValueError, TypeError):
+        return "INVALID", None  # tells the caller "reject this request"
 
-    # Start building the database question
+
+# ── Helper: ask the database for one page of products ───────────────────
+# "last_time" and "last_id" together are the bookmark.
+def get_one_page(category, search, price_min, price_max, last_time, last_id):
     query = supabase.table("products").select("*")
 
     # Add filters only if the user actually picked them
-    if category:   query = query.eq("category", category)
-    if search:     query = query.ilike("name", "%" + search + "%")
-    if price_min:  query = query.gte("price", float(price_min))
-    if price_max:  query = query.lte("price", float(price_max))
+    if category:
+        query = query.eq("category", category)
+    if search:
+        query = query.ilike("name", "%" + search + "%")
+    if price_min:
+        query = query.gte("price", float(price_min))
+    if price_max:
+        query = query.lte("price", float(price_max))
 
-    # THE IMPORTANT PART:
-    # Instead of saying "skip 100 rows" (which breaks when new products are added),
-    # we say "give me products that are OLDER than the last one I saw."
-    # We use both the time AND the id, in case two products were added at the exact same second.
+    # THE IMPORTANT PART — this is the whole point of the assignment:
+    #
+    # Instead of saying "skip 100 rows, give me the next 50" (which breaks
+    # the moment someone inserts a new row — you either see a repeat or
+    # miss one), we say:
+    #
+    #   "Give me products that come AFTER the last one I already saw,
+    #    in newest-first order."
+    #
+    # We compare BOTH created_at AND id together, because two products
+    # could in theory share the exact same created_at — id never repeats,
+    # so it breaks the tie and guarantees a strict, total order.
+    #
+    # New products being inserted right now always land ABOVE this
+    # bookmark (they're newer), so they never interfere with a page
+    # the user already fetched. No duplicates, nothing skipped.
     if last_time and last_id:
         query = query.or_(
             "created_at.lt." + last_time + ","
             "and(created_at.eq." + last_time + ",id.lt." + last_id + ")"
         )
 
-    # Newest products first, use id to break ties
+    # Newest first, id as the tiebreaker — this matches the index
+    # created in setup.sql, so the database doesn't have to sort
+    # all 200,000 rows on every request.
     query = query.order("created_at", desc=True).order("id", desc=True)
-
-    # Only get 50 at a time
     query = query.limit(HOW_MANY_PER_PAGE)
 
-    return query.execute().data  # actually run the question and return the list
+    return query.execute().data
 
 
-# ── Route: serve the website ───────────────────────────────────────────────────
+# ── Route: serve the website ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def home():
-    return send_file("index.html")  # just send the HTML file
+    return send_file("index.html")
 
 
-# ── Route: GET /products ───────────────────────────────────────────────────────
+# ── Route: GET /products ─────────────────────────────────────────────────
 # The website calls this to get the next page of products.
-# Example: /products?category=Books&cursor=2024-01-01&cursor_id=5
+# Example: /products?category=Books&cursor=2024-01-01T00:00:00&cursor_id=5
 @app.route("/products", methods=["GET"])
 def get_products():
-
-    # Read what the website is asking for
-    category  = request.args.get("category")
-    search    = request.args.get("q")
+    category = request.args.get("category")
+    search = request.args.get("q")
     price_min = request.args.get("price_min")
     price_max = request.args.get("price_max")
-    last_time = request.args.get("cursor")       # bookmark: time of last product seen
-    last_id   = request.args.get("cursor_id")    # bookmark: id of last product seen
 
-    # Go get the products
+    raw_time = request.args.get("cursor")      # bookmark: time of last product seen
+    raw_id = request.args.get("cursor_id")      # bookmark: id of last product seen
+
+    last_time, last_id = read_the_bookmark(raw_time, raw_id)
+    if last_time == "INVALID":
+        return jsonify({"error": "cursor and cursor_id must be a valid timestamp and integer"}), 400
+
     products = get_one_page(category, search, price_min, price_max, last_time, last_id)
 
-    # Make a new bookmark pointing to the last product in this page,
-    # so the next request knows where to continue
-    next_time = None
-    next_id   = None
+    # Make a new bookmark pointing at the last product on THIS page,
+    # so the next request knows exactly where to continue.
+    next_time, next_id = None, None
     if products:
-        last_product = products[-1]       # the very last product in the list
+        last_product = products[-1]
         next_time = last_product["created_at"]
-        next_id   = last_product["id"]
+        next_id = last_product["id"]
 
     return jsonify({
-        "products":       products,
-        "next_cursor":    next_time,
+        "products": products,
+        "next_cursor": next_time,
         "next_cursor_id": next_id,
     })
 
 
-# ── Route: GET /products/jump?page=56 ─────────────────────────────────────────
-# This lets someone jump straight to page 56 (or any page number).
-#
-# HOW JUMPING WORKS (important to understand):
-#   With our bookmark system, there's no such thing as "page 56" stored anywhere.
-#   To get to page 56, we have to flip through pages 1, 2, 3 ... 55 first,
-#   just collecting the bookmark at the end of each page (not the full products).
-#   Then on page 56 we fetch the real products.
-#
-#   It's like a book with no page numbers — to find chapter 56,
-#   you have to count 55 chapter endings first.
-#
-@app.route("/products/jump", methods=["GET"])
-def jump_to_page():
-
-    # Read the page number they want
-    try:
-        target_page = int(request.args.get("page", 1))
-    except ValueError:
-        return jsonify({"error": "page must be a number"}), 400
-
-    # Basic safety checks
-    if target_page < 1:
-        return jsonify({"error": "page must be 1 or higher"}), 400
-    if target_page > 500:
-        return jsonify({"error": "page must be 500 or lower"}), 400
-
-    category  = request.args.get("category")
-    search    = request.args.get("q")
-    price_min = request.args.get("price_min")
-    price_max = request.args.get("price_max")
-
-    # Start with no bookmark (beginning of the list)
-    last_time = None
-    last_id   = None
-
-    # Flip through pages 1 to (target_page - 1), only grabbing the bookmark each time
-    for page_number in range(1, target_page):
-
-        # Ask for just the id and time (not all columns) — faster since we don't need full data
-        query = supabase.table("products").select("id, created_at")
-
-        if category:   query = query.eq("category", category)
-        if search:     query = query.ilike("name", "%" + search + "%")
-        if price_min:  query = query.gte("price", float(price_min))
-        if price_max:  query = query.lte("price", float(price_max))
-
-        if last_time and last_id:
-            query = query.or_(
-                "created_at.lt." + last_time + ","
-                "and(created_at.eq." + last_time + ",id.lt." + last_id + ")"
-            )
-
-        query = query.order("created_at", desc=True).order("id", desc=True).limit(HOW_MANY_PER_PAGE)
-        rows = query.execute().data
-
-        # If we got nothing, the page they asked for doesn't exist
-        if not rows:
-            return jsonify({
-                "products": [],
-                "next_cursor": None,
-                "next_cursor_id": None,
-                "page": target_page,
-            })
-
-        # Save the bookmark for the next hop
-        last_time = rows[-1]["created_at"]
-        last_id   = rows[-1]["id"]
-
-    # Now fetch the actual products for the target page
-    products = get_one_page(category, search, price_min, price_max, last_time, last_id)
-
-    # Make the bookmark for the page after this one
-    next_time = None
-    next_id   = None
-    if products:
-        next_time = products[-1]["created_at"]
-        next_id   = products[-1]["id"]
-
-    return jsonify({
-        "products":       products,
-        "next_cursor":    next_time,
-        "next_cursor_id": next_id,
-        "page":           target_page,
-    })
-
-
-# ── Route: POST /admin/add ─────────────────────────────────────────────────────
-# Adds new products to the database.
-# Used by the admin panel on the website.
+# ── Route: POST /admin/add ───────────────────────────────────────────────
+# Adds new products to the database. Used by the admin panel on the
+# website to simulate new products arriving while someone is browsing —
+# this is how you prove pagination stays correct while data changes.
 @app.route("/admin/add", methods=["POST"])
 def admin_add_products():
-
     body = request.get_json(silent=True)
 
-    # CASE 1: Someone filled in the manual form with a specific product
+    # CASE 1: someone filled in the manual form with a specific product
     if body and "name" in body:
-        name     = body.get("name", "").strip()
+        name = body.get("name", "").strip()
         category = body.get("category", "").strip()
-        try:    price = float(body.get("price", 0))
-        except: price = 0.0
+        try:
+            price = float(body.get("price", 0))
+        except (TypeError, ValueError):
+            price = 0.0
 
-        # Check all fields are filled in properly
         if not name or not category or price <= 0:
             return jsonify({"message": "Please provide a name, category, and valid price."}), 400
 
-        # Don't add the same product name twice
         already_exists = supabase.table("products").select("id").eq("name", name).limit(1).execute()
         if already_exists.data:
             return jsonify({"message": "A product with that name already exists."}), 409
 
         now = datetime.datetime.now().isoformat()
         result = supabase.table("products").insert({
-            "name":      name,
-            "category":  category,
-            "price":     price,
+            "name": name,
+            "category": category,
+            "price": price,
             "image_url": "https://placehold.co/300x300?text=" + name.replace(" ", "+"),
             "created_at": now,
             "updated_at": now,
         }).execute()
+
         return jsonify({"message": "Product added!", "product": result.data[0]}), 201
 
-    # CASE 2: The "Add Random Products" demo button was clicked
-    count          = int(request.args.get("count", 5))
+    # CASE 2: the "Add Random Products" demo button was clicked
+    count = int(request.args.get("count", 5))
     forced_category = request.args.get("category")
     if forced_category not in PRODUCT_NAMES:
         forced_category = None
 
     new_products = []
     for _ in range(count):
-        cat  = forced_category or random.choice(list(PRODUCT_NAMES.keys()))
+        cat = forced_category or random.choice(list(PRODUCT_NAMES.keys()))
         name = random.choice(BRANDS) + " " + random.choice(PRODUCT_NAMES[cat])
-        now  = datetime.datetime.now().isoformat()
+        now = datetime.datetime.now().isoformat()
         new_products.append({
-            "name":      name,
-            "category":  cat,
-            "price":     round(random.uniform(10, 5000), 2),
+            "name": name,
+            "category": cat,
+            "price": round(random.uniform(10, 5000), 2),
             "image_url": "https://placehold.co/300x300?text=" + name.replace(" ", "+"),
             "created_at": now,
             "updated_at": now,
@@ -252,6 +199,6 @@ def admin_add_products():
     return jsonify({"message": f"Added {count} new products", "products": new_products})
 
 
-# ── Start the server ───────────────────────────────────────────────────────────
+# ── Start the server ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
